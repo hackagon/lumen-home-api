@@ -1,0 +1,152 @@
+version: '3.9'
+
+networks:
+  app-net:
+    driver: bridge
+
+services:
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mydb
+    # user: postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgresql_data:/var/lib/postgresql/data
+      - ./docker_postgres_init.sql:/docker-entrypoint-initdb.d/docker_postgres_init.sql
+    networks:
+      - app-net
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  adminer:
+    image: adminer:standalone
+    restart: always
+    ports:
+      - 8080:8080
+    networks:
+      - app-net
+
+  zookeeper:
+    image: docker.io/bitnami/zookeeper:3.8.1
+    ports:
+      - 2181:2181
+    volumes:
+      - zookeeper_data:/bitnami:z
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    networks:
+      - app-net
+
+  kafka:
+    image: bitnami/kafka:3.4.0
+    ports:
+      - 9092:9092
+      - 9094:9094
+    environment:
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      # https://developer.confluent.io/learn/kraft/
+      - KAFKA_ENABLE_KRAFT=no
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CFG_LISTENERS=INTERNAL://:9092,EXTERNAL://:9094
+      # https://www.confluent.io/blog/kafka-listeners-explained/
+      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL
+      # https://github.com/wurstmeister/kafka-docker#broker-ids
+      - KAFKA_BROKER_ID=101
+    volumes:
+      - kafka_data:/bitnami:z
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: kafka-topics.sh --bootstrap-server localhost:9092 --list
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    networks:
+      - app-net
+
+  kafka-admin:
+    image: 'docker.redpanda.com/vectorized/console:latest'
+    ports:
+      - 8082:8080
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+    volumes:
+      - kafka_admin_data:/kafka-admin:z
+    depends_on:
+      - zookeeper
+      - kafka
+    networks:
+      - app-net
+
+  # services
+  aggregation:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.aggregation
+    command: yarn start:dev:aggregation
+    env_file:
+      - ./apps/aggregation-service/.env.docker
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    ports:
+      - '16001:6001'
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - app-net
+
+  sso:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.sso
+    command: bash -c "yarn migration:dev:sso && yarn start:dev:sso"
+    env_file:
+      - ./apps/sso-service/.env.docker
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    networks:
+      - app-net
+
+  booking:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.booking
+    command: bash -c "yarn migration:dev:booking && yarn start:dev:booking"
+    env_file:
+      - ./apps/booking-service/.env.docker
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    networks:
+      - app-net
+
+volumes:
+  docker_data:
+  postgresql_data:
+  zookeeper_data:
+  kafka_data:
+  kafka_admin_data:
